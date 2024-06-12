@@ -4,4 +4,5 @@ torchsummary
 opencv-python
 pandas
 tqdm
+Flask
 -e .
