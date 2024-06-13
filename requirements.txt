@@ -5,4 +5,5 @@ opencv-python
 pandas
 tqdm
 Flask
+nltk
 -e .
