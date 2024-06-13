@@ -6,4 +6,5 @@ pandas
 tqdm
 Flask
 nltk
+spacy
 -e .
