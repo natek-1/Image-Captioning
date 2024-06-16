@@ -7,4 +7,5 @@ tqdm
 Flask
 nltk
 spacy
+tensorboard
 -e .
