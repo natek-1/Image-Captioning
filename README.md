@@ -45,12 +45,19 @@ To get started with using this project, follow the installation instructions abo
 
 ![Example Image](images/example1.png)
 
+## Dataset
+
+* Flickr8k
+
+Since I would be running this model from my personal resources, I would only test on the Flickr8k dataset and reproduce the reuslts only on that dataset
+
+
 ## References
 
 - [Show, Attend and Tell: Neural Image Caption Generation with Visual Attention](https://arxiv.org/abs/1502.03044) by Kelvin Xu et al.
+- [Flickr8k Dataset](https://academictorrents.com/details/9dea07ba660a722ae1008c4c8afdd303b6f6e53b)
 
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
----
