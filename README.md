@@ -2,6 +2,8 @@
 
 This repository contains an implementation of the "Show, Attend and Tell" model for generating descriptive captions for images using a neural network with visual attention. By integrating a Convolutional Neural Network (CNN) for image feature extraction and a Recurrent Neural Network (RNN) with an attention mechanism, the model dynamically focuses on different parts of an image while generating each word of the caption. This approach results in more accurate and contextually relevant image captions.
 
+I will try to the best of my abilities to follow the implementation of the paper as it was presented. However, I will only be implementing "soft" attention as Described in the paper.
+
 ## Features
 
 - **Image Feature Extraction:** Utilizes a pre-trained CNN to extract high-dimensional feature vectors from input images.
@@ -56,6 +58,7 @@ Since I would be running this model from my personal resources, I would only tes
 
 - [Show, Attend and Tell: Neural Image Caption Generation with Visual Attention](https://arxiv.org/abs/1502.03044) by Kelvin Xu et al.
 - [Flickr8k Dataset](https://academictorrents.com/details/9dea07ba660a722ae1008c4c8afdd303b6f6e53b)
+- [Neural Machine Translation By Jointly Learning to Align And Translate](https://arxiv.org/pdf/1409.0473.pdf) Dzmitry Bahdanau et al.
 
 ## License
 
