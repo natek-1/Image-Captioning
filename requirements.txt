@@ -9,4 +9,5 @@ nltk
 spacy
 tensorboard
 matplotlib
+seaborn
 -e .
