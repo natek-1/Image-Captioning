@@ -2,7 +2,7 @@ torch==2.0.1
 torchvision
 torchsummary
 opencv-python
-pandas
+pandas==2.1.0
 tqdm
 Flask
 nltk
@@ -10,4 +10,5 @@ spacy
 tensorboard
 matplotlib
 seaborn
+numpy==1.26.4
 -e .
