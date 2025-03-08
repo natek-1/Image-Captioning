@@ -8,9 +8,9 @@ from torch.nn.utils.rnn import pad_sequence, unpad_sequence
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 from torchvision.transforms import transforms
-from torchvision.models import resnet50, vgg19
+from torchvision.models import vgg19
 from tqdm import tqdm
-import torchsummary
+from torchsummary import torchsummary
 import torch.nn.functional as F
 import seaborn as sns
 from collections import defaultdict
@@ -18,6 +18,8 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from collections import defaultdict
 from nltk.translate.bleu_score import corpus_bleu
+from torchvision.models import vgg19, VGG19_Weights
+import torch.nn as nn
 
 
 def train_val_split(caption_data, train_size=0.8, shuffle=True):
@@ -56,8 +58,7 @@ data_dict = {}
 caption_dict = defaultdict(list)
 for _, row in df.iterrows():
     caption_dict[row.image].append(row.caption)
-train_data, val_data = train_val_split(caption_dict)
-
+    
 
 class Vocabulary():
     spacy_eng = spacy.load("en_core_web_sm")
@@ -100,162 +101,233 @@ class Vocabulary():
     
     def vocabulary_size(self):
         return len(self.stoi)
+    
+    
+vocabulary = Vocabulary(1)
+vocabulary.build_vocabulary(pd.read_csv("data/captions.txt").caption.to_list())
 
 class FlickrDataset(Dataset):
-
-    def __init__(self, image_dir, vocabulary: Vocabulary, data_dict, transform=None, train=True):
+    max_len = 45
+    def __init__(self, root_dir, data_dict, vocabulary: Vocabulary, transform=None, train=True):
+        self.root_dir = root_dir
         self.data_dict = data_dict
         self.transform = transform
-        self.image_dir = image_dir
 
-
+        # get the image and caption
         self.train = train
+        self.caption = []
         self.item = self.setup_item()
-        
-        self.vocabulary = vocabulary
 
+        # Create our own vocabulary
+        self.vocabulary = vocabulary
+        self.sos_token = torch.tensor([self.vocabulary.stoi['<SOS>']], dtype=torch.int64)
+        self.eos_token = torch.tensor([self.vocabulary.stoi['<EOS>']], dtype=torch.int64)
+        self.pad_token = torch.tensor([self.vocabulary.stoi['<PAD>']], dtype=torch.int64)
+    
+    def __len__(self):
+        return len(self.item)
     
     def setup_item(self):
         item = []
         if self.train:
             for image_id, image_captions in self.data_dict.items():
                 for caption in image_captions:
+                    self.caption.append(caption)
                     item.append((image_id, caption))
         else:
             for image_id, image_captions in self.data_dict.items():
+                self.caption.extend(image_captions)
                 item.append((image_id, image_captions))
         return item
-
-    def __len__(self):
-        return len(self.item)
-
-
+    
     def __getitem__(self, index):
-        image_path = os.path.join(self.image_dir, self.item[index][0])
+        # get image
+        image_path = os.path.join(self.root_dir, self.item[index][0])
         img = Image.open(image_path).convert('RGB')
 
         if self.transform is not None:
             img = self.transform(img)
+        
+        # get caption
         caption = self.item[index][1]
+        
         if self.train:
-            num_caption = [self.vocabulary.stoi['<SOS>']]
-            num_caption += self.vocabulary.tokenize(caption)
-            num_caption.append(self.vocabulary.stoi['<EOS>'])
-            num_caption = torch.tensor(num_caption)
+            cap_len = len(self.vocabulary.tokenize(caption))
+            num_pad = FlickrDataset.max_len - cap_len - 2
+            if num_pad < 0:
+                raise ValueError("Caption too long")
+            num_caption = torch.cat([
+                        self.sos_token ,
+                        torch.tensor(self.vocabulary.tokenize(caption), dtype=torch.int64),
+                        self.eos_token,
+                        torch.tensor([self.pad_token] * num_pad, dtype=torch.int64)], dim=0)
             return img, num_caption
         else:
-            captions = []
-            for cap in caption:
-                num_caption = [self.vocabulary.stoi['<SOS>']]
-                num_caption += self.vocabulary.tokenize(cap)
-                num_caption.append(self.vocabulary.stoi['<EOS>'])
-                captions.append(torch.tensor(num_caption))
-            return img, pad_sequence(captions, batch_first=False, padding_value=0)
+            captions = torch.zeros(5, 45).to(torch.long)
+            for idx, cap in enumerate(caption):
+                cap_len = len(self.vocabulary.tokenize(cap))
+                num_pad = FlickrDataset.max_len - cap_len - 2
+                if num_pad < 0:
+                    raise ValueError("Caption too long")
+                num_caption =    torch.cat([
+                        self.sos_token ,
+                        torch.tensor(self.vocabulary.tokenize(cap), dtype=torch.int64),
+                        self.eos_token,
+                        torch.tensor([self.pad_token] * num_pad, dtype=torch.int64)], dim=0)
 
-class MyCollate:
-    def __init__(self, pad_idx, train=True):
-        self.pad_idx = pad_idx
-        self.train = train
-    
-    def __call__(self, batch): # pad sequnece
-        img = [item[0].unsqueeze(0) for item in batch]
-        img = torch.cat(img, 0)
-        target = [item[1] for item in batch]
-        if self.train:
-            target = pad_sequence(target, batch_first=True, padding_value=self.pad_idx)
-        else:
-            #for i in target:
-            #    print(i.shape)
-            target = pad_sequence(target, batch_first=True, padding_value=self.pad_idx)
-            target=target.permute(0, 2, 1).contiguous() #get back to regular batch_first = True
+                captions[idx] = num_caption
+            return img, torch.LongTensor(captions)
 
-        return img, target
 
 def get_loader(
-        image_folder,
+        root_dir,
         data_dict,
         vocabulary,
         transform,
         train=True,
         batch_size=32,
-        num_worker=0,
         shuffle=True,
-        pin_memory=True
 ):
-    dataset = FlickrDataset(image_dir=image_folder, vocabulary=vocabulary, data_dict=data_dict,
-                            transform=transform, train=train)
-    pad_idx = vocabulary.stoi["<PAD>"]
-    
+    dataset = FlickrDataset(root_dir=root_dir, data_dict=data_dict, vocabulary=vocabulary,
+                        transform=transform, train=train)
+        
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        collate_fn=MyCollate(pad_idx=pad_idx, train=train),
-        pin_memory=pin_memory,
         shuffle=shuffle,
-        num_workers=num_worker,
     )
-
     return loader, dataset
+
+folder = "data/images/"
+df = pd.read_csv("data/captions.txt")
+data_dict = {}
+caption_dict = defaultdict(list)
+for _, row in df.iterrows():
+    caption_dict[row.image].append(row.caption)
+train_data, val_data = train_val_split(caption_dict)
 
 transform = transforms.Compose([
     transforms.Resize((256, 256)),
-    transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                          std=[0.26862954, 0.26130258, 0.27577711])
 ])
 
+train_dataset = FlickrDataset(root_dir=folder, data_dict=train_data,vocabulary=vocabulary,
+                        transform=transform, train=True)
+train_loader = DataLoader(dataset=train_dataset, batch_size=32, shuffle=True)
+
+
+
+import torchvision
+from torchvision.models import ResNet101_Weights
+
 class Encoder(nn.Module):
+    """
+    Encoder.
+    """
 
-    def __init__(self):
+    def __init__(self, encoded_image_size=14):
         super(Encoder, self).__init__()
-        model = vgg19("VGG19_Weights.IMAGENET1K_V1")
-        self.model = list(model.features.children())[:-1]
-        self.model = nn.Sequential(*self.model)
-        self.dim = 512
-    
-    def fine_tine(self, finetune=False):
-        for param in self.model.parameters():
-            param.requires_grad = finetune
-    
-    def forward(self, images):
-        out = self.model(images)
-        out = out.permute(0, 2, 3, 1)
-        out = out.view(out.size(0), -1, out.size(-1))
-        return out
+        self.enc_image_size = encoded_image_size
 
+        resnet = torchvision.models.resnet101()  # pretrained ImageNet ResNet-101
+
+        # Remove linear and pool layers (since we're not doing classification)
+        modules = list(resnet.children())[:-2]
+        self.resnet = nn.Sequential(*modules)
+
+        # Resize image to fixed size to allow input images of variable size
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((encoded_image_size, encoded_image_size))
+        self.dim = 2048
+        #self.fine_tune()
+
+    def forward(self, images):
+        """
+        Forward propagation.
+
+        :param images: images, a tensor of dimensions (batch_size, 3, image_size, image_size)
+        :return: encoded images
+        """
+        out = self.resnet(images)  # (batch_size, 2048, image_size/32, image_size/32)
+        #out = self.adaptive_pool(out)  # (batch_size, 2048, encoded_image_size, encoded_image_size)
+        out = out.permute(0, 2, 3, 1)  # (batch_size, encoded_image_size, encoded_image_size, 2048)
+        out = out.view(out.shape[0],-1,out.shape[-1])
+        return out
+    
+    
 class Attention(nn.Module):
     """
-    Attention Network. Using Additive or BahdanauAttention
+    Attention Network.
     """
+
     def __init__(self, encoder_dim, decoder_dim, attention_dim):
+        """
+        :param encoder_dim: feature size of encoded images
+        :param decoder_dim: size of decoder's RNN
+        :param attention_dim: size of the attention network
+        """
         super(Attention, self).__init__()
-        self.encoder_attention = nn.Linear(encoder_dim, attention_dim)
-        self.decorder_attention = nn.Linear(decoder_dim, attention_dim)
-        self.attend = nn.Linear(attention_dim, 1)
-        self.tanh = nn.Tanh()
-        self.softmax = nn.Softmax(dim=1)
+        self.encoder_att = nn.Linear(encoder_dim, attention_dim, bias=False)  # linear layer to transform encoded image
+        self.decoder_att = nn.Linear(decoder_dim, attention_dim, bias=False)  # linear layer to transform decoder's output
+        self.full_att = nn.Linear(attention_dim, 1, bias=False)  # linear layer to calculate values to be softmax-ed
+        self.relu = nn.ReLU()
+        self.softmax = nn.Softmax(dim=1)  # softmax layer to calculate weights
+
+    '''def forward(self, encoder_out, decoder_hidden):
+        """
+        Forward propagation.
+        num pixel is just 196 in out case
+        :param encoder_out: encoded images, a tensor of dimension (batch_size, num_pixels, encoder_dim)
+        :param decoder_hidden: previous decoder output, a tensor of dimension (batch_size, decoder_dim)
+        :return: attention weighted encoding, weights ()
+        """
+        att1 = self.encoder_att(encoder_out)  # (batch_size, num_pixels, attention_dim)
+        att2 = self.decoder_att(decoder_hidden)  # (batch_size, attention_dim)
+        att = self.full_att(self.relu(att1 + att2.unsqueeze(1))).squeeze(-1)  # (batch_size, num_pixels, 1) -> (batch_size, num_pixels)
+        alpha = self.softmax(att)  # (batch_size, num_pixels)
+        attention_weighted_encoding = (encoder_out * alpha.unsqueeze(2)).sum(dim=1)  # (batch_size, encoder_dim)
+        return attention_weighted_encoding, alpha'''
+
+    def forward(self, encoder_out, decoder_hidden):
+        """
+        Forward propagation.
+        num pixel is just 196 in out case
+        :param encoder_out: encoded images, a tensor of dimension (batch_size, num_pixels, encoder_dim)
+        :param decoder_hidden: previous decoder output, a tensor of dimension (batch_size, decoder_dim)
+        :return: attention weighted encoding, weights ()
+        """
+        att1 = self.encoder_att(encoder_out)  # (batch_size, num_pixels, attention_dim)
+        att2 = self.decoder_att(decoder_hidden)  # (batch_size, attention_dim)
+        att = self.full_att(self.relu(att1 + att2.unsqueeze(1))).squeeze(-1)  # (batch_size, num_pixels, 1) -> (batch_size, num_pixels)
+        alpha = self.softmax(att).unsqueeze(1)  # (batch_size, 1, num_pixels)
+        attention_weighted_encoding = torch.bmm(alpha, encoder_out).squeeze(1)  # (batch_size, encoder_dim)
+        return attention_weighted_encoding, alpha.squeeze(1)
     
-    def forward(self, encoder_out, hidden_state):
-        img_matrix = self.encoder_attention(encoder_out) # (batch_size, num_pixels, attention_dim)
-        hidden_matrix = self.decorder_attention(hidden_state).unsqueeze(1) #(batch_size, 1, attention_dim)
-        add = self.tanh(img_matrix + hidden_matrix) # (batch_size, num_pixels, attention_dim)
-        att = self.attend(add).squeeze(2) # (batch_size, num_pixels)
-        alpha = self.softmax(att) # (batch_size, num_pixels)
-        weighted_context = (encoder_out * alpha.unsqueeze(2)).sum(dim=1) # (batch_size, encoder_dim)
-        return weighted_context, alpha
+    
+attention = Attention(encoder_dim=2048, decoder_dim=512, attention_dim=128)
 
+for images, _ in train_loader:
+    break
 
+decoder_hidden = torch.randn(32, 512)       # Batch size 32, decoder dim 512
+encoder = Encoder()
+encoder_outputs = encoder(images)
+context_vector, attn_weights = attention(encoder_outputs, decoder_hidden)
 
+print(attn_weights.shape)    # (32, 10)
+print(attn_weights.max(dim=-1))
+print("-"*100)
+        
 class Decoder(nn.Module):
     
-    def __init__(self, embed_dim, attention_dim, encoder_dim, decoder_dim, vocab_size):
+    def __init__(self, embed_dim, attention_dim, encoder_dim, decoder_dim, vocab_size, dropout):
 
         super(Decoder, self).__init__()
         self.attention = Attention(encoder_dim, decoder_dim, attention_dim)
 
         self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.dropout = nn.Dropout()
+        self.dropout = nn.Dropout(dropout)
 
         self.f_beta = nn.Linear(decoder_dim, encoder_dim)
         self.sigmoid = nn.Sigmoid()
@@ -269,113 +341,58 @@ class Decoder(nn.Module):
 
     
     def init_hidden_state(self, encoder_out: torch.Tensor):
-        average_out = encoder_out.mean(dim=1)
-        h = self.init_h(average_out)
-        c = self.init_c(average_out)
+        average_out = encoder_out.mean(dim=1) # output of shape (batch_size,  encoder_dim)
+        h = self.init_h(average_out) # -> (batch_size,  decoder_dim)
+        c = self.init_c(average_out) # -> (batch_size,  decoder_dim)
         return h, c
     
 
     def forward(self, encoder_out, caption):
+        '''
+        encoder_out will be of shape (batch_size, num_pixels, encoder_dim) eg (32, 196, 512)
+        caption will be of shape (batch_size, 44) for training (only dealing with one caption) eg (32, 44)
+        '''
+        embeddings = self.embedding(caption) # -> (batch_size, max_seq_length, embedding_dim)
+        cap_len = caption.size(-1)
 
-        embeddings = self.embedding(caption)
-
-        h, c = self.init_hidden_state(encoder_out)
+        h, c = self.init_hidden_state(encoder_out) # both are of shape (batch_size, decoder_dim)
         device = h.device
 
         predictions = torch.zeros(caption.shape[0], caption.shape[1], self.vocab_size).to(device)
         alphas = torch.zeros(caption.shape[0], caption.shape[1], encoder_out.shape[1]).to(device)
 
-        for i in range(caption.size(-1)):
+        for i in range(cap_len):
             weighted_context, alpha = self.attention(encoder_out, h)
             #gate = self.sigmoid(self.f_beta(h))
             #weighted_context = gate * weighted_context
-            lstm_input = torch.cat([embeddings[:,i,:], weighted_context], dim=1)
-            h, c = self.lstm(lstm_input, (h, c))
-            word_prop = self.output(self.dropout(h))
             
-            for j in range(word_prop.size(0)):
-                predictions[j,i] = word_prop[j]
-            for j in range(alpha.size(0)):
-                alphas[j,i] = alpha[j]
+            # (batch_size, embedding_dim), (batch_size, encoder_dim) -> (batch_size, embedding_dim + encoder_dim)
+            lstm_input = torch.cat([weighted_context, embeddings[:,i,:]], dim=1)
+            h, c = self.lstm(lstm_input, (h, c)) # both are of shape (batch_size, decoder_dim)
+            word_prop = self.output(self.dropout(h))  # shape (batch_size, vocab_size)
+            
+            predictions[:,i,:] = word_prop
+            alphas[:,i,:] = alpha
+                
         return predictions, alphas
-
-
-class Caption(nn.Module):
-    def __init__(self, embed_dim, attention_dim, encoder_dim, decoder_dim, vocab_size):
-        super(Caption, self).__init__()
-        self.encoder = Encoder()
-        self.decoder = Decoder(embed_dim=embed_dim, attention_dim=attention_dim,
-                               encoder_dim=encoder_dim, decoder_dim=decoder_dim, vocab_size=vocab_size)
-        self.encoder.fine_tine()
     
-    def forward(self, img, captions):
-        features = self.encoder(img)
-        predictions, alphas = self.decoder(features, captions)
-        return predictions, alphas
-
-
-def train_epoch(train_loader, captioner, device, criterion, optimizer, alpha_c, epoch):
-    losses = []
-
-    captioner.train()
-
-    for idx, (imgs, caps) in enumerate(tqdm(train_loader, total=len(train_loader))):
-        # move tensor to device if available
-        imgs = imgs.to(device)
-        caps = caps.to(device)
-
-        optimizer.zero_grad()
-
-        # forward prop
-        predictions, alphas = captioner(imgs, caps)
-        print(predictions.shape)
-        print(caps.shape)
-        loss = criterion(predictions.view(-1, predictions.size(-1)), caps.view(-1))
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(captioner.parameters(), max_norm=1.)
-        optimizer.step()
-
-        # keep track of metrics
-        losses.append(loss.item())
-        break
-        
-
-    print('Training Epoch #: [{0}]\t'
-        'Loss: {loss:.4f}\t'.format(
-                epoch, loss=np.mean(losses)))
-
-    return np.mean(losses)
-
-
-
-embed_dim = 512
-attention_dim = 64
-decoder_dim = 64
-encoder_dim = 512
-lr = 1e-6
-alpha_c = 1.
-vocabulary = Vocabulary(1)
-vocabulary.build_vocabulary(pd.read_csv("data/captions.txt").caption.to_list())
-vocab_size = len(vocabulary)
-epochs = 100
-
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cpu"
-elif torch.backends.mps.is_available():
-    device="mps"
-
-
-model = Caption(embed_dim=embed_dim, attention_dim=attention_dim, encoder_dim=encoder_dim,
-                decoder_dim=decoder_dim, vocab_size=vocab_size).to(device)
-criterion = nn.CrossEntropyLoss(ignore_index=vocabulary.stoi["<PAD>"])
-optimizer = torch.optim.Adam(params=model.parameters(),
-                             lr=lr)
-train_loader, _ = get_loader(data_dict=train_data, transform=transform, vocabulary=vocabulary, image_folder="data/images/")
-for epoch in range(epochs):
-
-    loss = train_epoch(train_loader=train_loader, captioner=model, device=device,
-                            criterion=criterion, optimizer=optimizer, alpha_c=1., epoch=epoch)
-
     
+device = 'mps'
+for images, caption in train_loader:
+    images, caption = images.to(device), caption.to(device)
+    break
+encoder = Encoder().to(device)
+
+decoder = Decoder(64, 32, 2048, 512, vocabulary.vocabulary_size(), 0.1).to(device)
+encoder_outputs, decoder_hidden  = encoder_outputs.to(device), decoder_hidden.to(device) 
+
+
+output = encoder(images)
+
+preds, alphas = decoder(output, caption)
+#print("fist prediction: ", preds[0])
+#print("Arg max: ", preds[0].argmax(dim=-1))
+print("alpha sum", alphas[31,:,:].max(dim=-1))
+print("-"*100)
+print("alpha sum", alphas[:,31,:].max(dim=-1))
+
