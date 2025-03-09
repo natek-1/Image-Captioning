@@ -223,37 +223,26 @@ import torchvision
 from torchvision.models import ResNet101_Weights
 
 class Encoder(nn.Module):
-    """
-    Encoder.
-    """
 
-    def __init__(self, encoded_image_size=14):
-        super(Encoder, self).__init__()
-        self.enc_image_size = encoded_image_size
-
-        resnet = torchvision.models.resnet101()  # pretrained ImageNet ResNet-101
-
-        # Remove linear and pool layers (since we're not doing classification)
-        modules = list(resnet.children())[:-2]
-        self.resnet = nn.Sequential(*modules)
-
-        # Resize image to fixed size to allow input images of variable size
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((encoded_image_size, encoded_image_size))
-        self.dim = 2048
-        #self.fine_tune()
+    def __init__(self, train_CNN=False):
+        super(Encoder, self).__init__() # staying consistent with the paper by using vgg
+        self.train_CNN = train_CNN
+        self.model = vgg19()
+        self.model = nn.Sequential(*list(self.model.features.children())[:-1])
+        self.dim = 512
+        self.freeze()
+        
+    
+    def freeze(self):
+        for param in self.model.parameters():
+            param.requires_grad = self.train_CNN
 
     def forward(self, images):
-        """
-        Forward propagation.
-
-        :param images: images, a tensor of dimensions (batch_size, 3, image_size, image_size)
-        :return: encoded images
-        """
-        out = self.resnet(images)  # (batch_size, 2048, image_size/32, image_size/32)
-        #out = self.adaptive_pool(out)  # (batch_size, 2048, encoded_image_size, encoded_image_size)
-        out = out.permute(0, 2, 3, 1)  # (batch_size, encoded_image_size, encoded_image_size, 2048)
-        out = out.view(out.shape[0],-1,out.shape[-1])
-        return out
+        features = self.model(images)
+        features = features.permute(0, 2, 3, 1)
+        features = features.view(features.shape[0], -1, features.shape[-1])
+        return features # output should be of shape (batch_size, 196, 512)
+    
     
     
 class Attention(nn.Module):
@@ -273,21 +262,9 @@ class Attention(nn.Module):
         self.full_att = nn.Linear(attention_dim, 1, bias=False)  # linear layer to calculate values to be softmax-ed
         self.relu = nn.ReLU()
         self.softmax = nn.Softmax(dim=1)  # softmax layer to calculate weights
-
-    '''def forward(self, encoder_out, decoder_hidden):
-        """
-        Forward propagation.
-        num pixel is just 196 in out case
-        :param encoder_out: encoded images, a tensor of dimension (batch_size, num_pixels, encoder_dim)
-        :param decoder_hidden: previous decoder output, a tensor of dimension (batch_size, decoder_dim)
-        :return: attention weighted encoding, weights ()
-        """
-        att1 = self.encoder_att(encoder_out)  # (batch_size, num_pixels, attention_dim)
-        att2 = self.decoder_att(decoder_hidden)  # (batch_size, attention_dim)
-        att = self.full_att(self.relu(att1 + att2.unsqueeze(1))).squeeze(-1)  # (batch_size, num_pixels, 1) -> (batch_size, num_pixels)
-        alpha = self.softmax(att)  # (batch_size, num_pixels)
-        attention_weighted_encoding = (encoder_out * alpha.unsqueeze(2)).sum(dim=1)  # (batch_size, encoder_dim)
-        return attention_weighted_encoding, alpha'''
+        nn.init.xavier_normal_(self.encoder_att.weight)
+        nn.init.xavier_normal_(self.decoder_att.weight)
+        nn.init.xavier_normal_(self.full_att.weight)
 
     def forward(self, encoder_out, decoder_hidden):
         """
@@ -303,28 +280,14 @@ class Attention(nn.Module):
         alpha = self.softmax(att).unsqueeze(1)  # (batch_size, 1, num_pixels)
         attention_weighted_encoding = torch.bmm(alpha, encoder_out).squeeze(1)  # (batch_size, encoder_dim)
         return attention_weighted_encoding, alpha.squeeze(1)
-    
-    
-attention = Attention(encoder_dim=2048, decoder_dim=512, attention_dim=128)
-
-for images, _ in train_loader:
-    break
-
-decoder_hidden = torch.randn(32, 512)       # Batch size 32, decoder dim 512
-encoder = Encoder()
-encoder_outputs = encoder(images)
-context_vector, attn_weights = attention(encoder_outputs, decoder_hidden)
-
-print(attn_weights.shape)    # (32, 10)
-print(attn_weights.max(dim=-1))
-print("-"*100)
         
+
 class Decoder(nn.Module):
     
     def __init__(self, embed_dim, attention_dim, encoder_dim, decoder_dim, vocab_size, dropout):
 
         super(Decoder, self).__init__()
-        self.attention = Attention(encoder_dim, decoder_dim, attention_dim)
+        self.attention = Attention(encoder_dim=encoder_dim, decoder_dim=decoder_dim, attention_dim=attention_dim)
 
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.dropout = nn.Dropout(dropout)
@@ -377,22 +340,141 @@ class Decoder(nn.Module):
         return predictions, alphas
     
     
-device = 'mps'
-for images, caption in train_loader:
-    images, caption = images.to(device), caption.to(device)
-    break
-encoder = Encoder().to(device)
+class Caption(nn.Module):
+    def __init__(self, embed_dim, attention_dim, encoder_dim, decoder_dim, vocab_size, dropout):
+        super(Caption, self).__init__()
+        self.encoder = Encoder()
+        self.decoder = Decoder(embed_dim=embed_dim, attention_dim=attention_dim,
+                               encoder_dim=encoder_dim, decoder_dim=decoder_dim, vocab_size=vocab_size, dropout=dropout)
+        #self.encoder.fine_tine()
+    
+    def forward(self, img, captions):
+        features = self.encoder(img)
+        predictions, alphas = self.decoder(features, captions)
+        return predictions, alphas
 
-decoder = Decoder(64, 32, 2048, 512, vocabulary.vocabulary_size(), 0.1).to(device)
-encoder_outputs, decoder_hidden  = encoder_outputs.to(device), decoder_hidden.to(device) 
+    def caption_img(self, img, vocab, max_length=100):
+        result_caption = []
+
+        with torch.no_grad():
+            feature = self.encoder(img) # (batch_size, num_pixels, decoder_dim) 
+            h, c = self.decoder.init_hidden_state(feature)
+
+            ## first input to the model
+            start = torch.zeros(size=(1,), dtype=torch.int)
+            start[0] = vocabulary.stoi['<SOS>']
+            start = start.unsqueeze(0) # shape (1, 1)
+            start = start.to(h.device)
+            embeddings = self.decoder.embedding(start).squeeze(0) # (1, embed_dim)
+            print("Embedding Shape:", embeddings.shape)
+
+            for _ in range(max_length):
+                weighted_context, alpha = self.decoder.attention(feature, h)
+                
+                #gate = self.decoder.sigmoid(self.decoder.f_beta(h))
+                #weighted_context = gate * weighted_context
+                
+                #print("Weighted context shape:",weighted_context.shape)
+                lstm_input = torch.cat([weighted_context, embeddings], dim=1) # batch_size, embed_dim+encode_dim
+                #print("Lstm input shape", lstm_input.shape)
+
+                h, c = self.decoder.lstm(lstm_input, (h, c))
+                #print("Hidden state shape", h.shape)
+                output = self.decoder.output(h.squeeze(0)) # removing the extra dimension needed in lstm, output.shape = (vocab_size)
+                
+                #print("Total output shape", output.shape)
+                predicted = output.argmax(dim=-1) # highest probablities word
+                result_caption.append(predicted.item())
+                embeddings = self.decoder.embedding(predicted).unsqueeze(0)
+                #print(embeddings.shape)
+                if vocab.itos[predicted.item()] == "<EOS>":
+                    break
+            
+            return [vocab.itos[idx] for idx in result_caption] #return the final sentence
 
 
-output = encoder(images)
 
-preds, alphas = decoder(output, caption)
-#print("fist prediction: ", preds[0])
-#print("Arg max: ", preds[0].argmax(dim=-1))
-print("alpha sum", alphas[31,:,:].max(dim=-1))
-print("-"*100)
-print("alpha sum", alphas[:,31,:].max(dim=-1))
+train_CNN = False
+embed_dim = 256
+attention_dim = 256
+decoder_dim = 256
+encoder_dim = 512
+vocab_size = vocabulary.vocabulary_size()
+num_layers = 1
+lr= 3e-4
+num_epochs = 100
+load_model = False
+save_model = False
+step = 0
 
+
+train_dataset = FlickrDataset(root_dir=folder, data_dict=train_data,vocabulary=vocabulary,
+                        transform=transform, train=True)
+train_loader = DataLoader(dataset=train_dataset, batch_size=16, shuffle=True)
+
+
+#writer = SummaryWriter(log_dir="runs/flickr")
+model_path = "state_dict.py"
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device="cpu"
+
+# Model
+model = Caption(embed_dim=embed_dim, attention_dim=attention_dim, encoder_dim=encoder_dim,
+                decoder_dim=decoder_dim, vocab_size=vocab_size, dropout=0.1).to(device)
+criterion = nn.CrossEntropyLoss(ignore_index=vocabulary.stoi["<PAD>"])
+optimizer = torch.optim.Adam(params=model.parameters(),
+                             lr=lr)
+start_epoch = 0
+if load_model:
+    state_dict = torch.load(model_path)
+    model = state_dict['model']
+    optimizer = state_dict['optimizer']
+    step = state_dict['steps']
+    start_epoch = 1 + state_dict['epochs']
+
+def train_epoch(train_loader, captioner: Caption, device, criterion, optimizer, epoch, alpha_c=None):
+    losses = []
+
+    captioner.train()
+
+    for idx, (imgs, caps) in enumerate(tqdm(train_loader, total=len(train_loader))):
+        # move tensor to device if available
+        imgs = imgs.to(device)
+        caps = caps.to(device)
+
+        optimizer.zero_grad()
+
+        # forward prop
+        predictions, alphas = captioner(imgs, caps)
+
+        
+        #att_regularization = alpha_c * ((1 - alphas.sum(1))**2).mean()
+        loss = criterion(predictions.view(-1, predictions.size(-1)), caps.view(-1)) #+ att_regularization
+
+        loss.backward()
+        #torch.nn.utils.clip_grad_norm_(captioner.parameters(), max_norm=1.)
+        optimizer.step()
+
+        # keep track of metrics
+        losses.append(loss.item())
+        break
+        
+
+    print('Training Epoch #: [{0}]\t'
+        'Loss: {loss:.4f}\t'.format(
+                epoch, loss=np.mean(losses)))
+
+    return np.mean(losses)
+
+for epoch in range(start_epoch, num_epochs):
+
+    loss = train_epoch(train_loader=train_loader, captioner=model, device=device,
+                            criterion=criterion, optimizer=optimizer, epoch=epoch)
+
+params = {
+    "model": model,
+}
+torch.save("model.py", params)
