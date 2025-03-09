@@ -477,4 +477,4 @@ for epoch in range(start_epoch, num_epochs):
 params = {
     "model": model,
 }
-torch.save("model.py", params)
+torch.save(params, "model.pt")
